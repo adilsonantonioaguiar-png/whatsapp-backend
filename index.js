@@ -1,1 +1,193 @@
-<div class="relative -mr-px mb-[20px] mt-[12px] flex w-[2px] cursor-col-resize items-center justify-center rounded-full transition-colors duration-300 ease-in-out after:absolute after:inset-y-0 after:left-1/2 after:w-4 after:-translate-x-1/2 data-[panel-group-direction=vertical]:h-px data-[panel-group-direction=vertical]:w-full data-[panel-group-direction=vertical]:after:left-0 data-[panel-group-direction=vertical]:after:h-1 data-[panel-group-direction=vertical]:after:w-full data-[panel-group-direction=vertical]:after:-translate-y-1/2 data-[panel-group-direction=vertical]:after:translate-x-0 hover:bg-accent-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 [&amp;[data-panel-group-direction=vertical]&gt;div]:rotate-90 z-[10000] ml-2" role="separator" tabindex="0" data-panel-group-direction="horizontal" data-panel-group-id="_r_h_" data-resize-handle="" data-panel-resize-handle-enabled="true" data-panel-resize-handle-id="_r_j_" data-resize-handle-state="inactive" aria-controls="_r_i_" aria-valuemax="41" aria-valuemin="22" aria-valuenow="38" style="touch-action: none; user-select: none; mask: linear-gradient(transparent 0%, rgb(255, 255, 255) 15%, rgb(255, 255, 255) 80%, transparent 100%);"><div class="absolute -left-[2px] -right-[2px] bottom-0 top-0 z-[12000]" data-state="closed"></div></div>
+// index.js - Backend WhatsApp Baileys para Railway
+import express from 'express';
+import cors from 'cors';
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+import qrcode from 'qrcode';
+import P from 'pino';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// Logger do Baileys
+const logger = P({ level: 'info' });
+
+// Armazena sessões ativas em memória
+const sessions = new Map();
+
+/**
+ * Cria ou obtém uma sessão existente
+ */
+async function createOrGetSession(sessionName) {
+  if (sessions.has(sessionName)) {
+    return sessions.get(sessionName);
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(`./auth_info_${sessionName}`);
+
+  const sock = makeWASocket({
+    logger,
+    auth: state,
+    printQRInTerminal: true,
+  });
+
+  let currentQR = null;
+  let isConnected = false;
+  let user = null;
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      currentQR = qr;
+      logger.info({ sessionName }, 'Novo QR code gerado');
+    }
+
+    if (connection === 'open') {
+      isConnected = true;
+      user = sock.user;
+      logger.info({ sessionName, user }, 'Sessão conectada');
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+      logger.warn({ sessionName, shouldReconnect }, 'Conexão fechada');
+      if (!shouldReconnect) {
+        sessions.delete(sessionName);
+      }
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  const sessionData = { sock, currentQR, isConnected, user, sessionName };
+  sessions.set(sessionName, sessionData);
+
+  return sessionData;
+}
+
+/**
+ * Rota de health check
+ */
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'WhatsApp Baileys backend rodando' });
+});
+
+/**
+ * Inicia sessão e retorna QR code
+ */
+app.post('/start-session', async (req, res) => {
+  try {
+    const { sessionName } = req.body;
+    if (!sessionName) {
+      return res.status(400).json({ error: 'sessionName é obrigatório' });
+    }
+
+    const session = await createOrGetSession(sessionName);
+
+    // Espera até 15s por um QR code
+    const start = Date.now();
+    while (!session.currentQR && Date.now() - start < 15000) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    if (!session.currentQR && !session.isConnected) {
+      return res.status(504).json({
+        error: 'Timeout ao gerar QR code',
+      });
+    }
+
+    const qrImage = await qrcode.toDataURL(session.currentQR || '');
+    return res.json({
+      qr: qrImage,
+      connected: session.isConnected,
+      user: session.user,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Erro em /start-session');
+    return res.status(500).json({ error: 'Erro ao iniciar sessão' });
+  }
+});
+
+/**
+ * Status da sessão
+ */
+app.get('/status/:sessionName', async (req, res) => {
+  try {
+    const { sessionName } = req.params;
+    const session = sessions.get(sessionName);
+
+    if (!session) {
+      return res.json({ connected: false, message: 'Sessão não encontrada' });
+    }
+
+    return res.json({
+      connected: session.isConnected,
+      user: session.user,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Erro em /status');
+    return res.status(500).json({ error: 'Erro ao obter status' });
+  }
+});
+
+/**
+ * Logout da sessão
+ */
+app.post('/logout/:sessionName', async (req, res) => {
+  try {
+    const { sessionName } = req.params;
+    const session = sessions.get(sessionName);
+
+    if (!session) {
+      return res.status(404).json({ error: 'Sessão não encontrada' });
+    }
+
+    await session.sock.logout();
+    sessions.delete(sessionName);
+
+    return res.json({ success: true });
+  } catch (err) {
+    logger.error({ err }, 'Erro em /logout');
+    return res.status(500).json({ error: 'Erro ao fazer logout' });
+  }
+});
+
+/**
+ * Enviar mensagem
+ */
+app.post('/send-message', async (req, res) => {
+  try {
+    const { sessionName, number, message } = req.body;
+
+    if (!sessionName || !number || !message) {
+      return res.status(400).json({ error: 'sessionName, number e message são obrigatórios' });
+    }
+
+    const session = sessions.get(sessionName);
+
+    if (!session || !session.isConnected) {
+      return res.status(400).json({ error: 'Sessão não está conectada' });
+    }
+
+    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+    await session.sock.sendMessage(jid, { text: message });
+
+    return res.json({ success: true });
+  } catch (err) {
+    logger.error({ err }, 'Erro em /send-message');
+    return res.status(500).json({ error: 'Erro ao enviar mensagem' });
+  }
+});
+
+app.listen(PORT, () => {
+  logger.info(`Servidor rodando na porta ${PORT}`);
+});
