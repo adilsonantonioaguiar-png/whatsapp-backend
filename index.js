@@ -1,134 +1,247 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'fs';
+import path from 'path';
 
+// Configuração básica
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-let sock;
-let currentQR = null; // Armazena a imagem base64 do QR
-let connectionStatus = 'iniciando';
+// Armazenamento em memória das sessões ativas
+// Estrutura: { [sessionName]: { sock: Socket, status: string, qrCode: string | null } }
+const sessions = new Map();
 
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+// Função para iniciar ou recuperar uma sessão específica
+async function startSession(sessionName) {
+    // Se já estiver conectado, não faz nada
+    if (sessions.has(sessionName) && sessions.get(sessionName).status === 'connected') {
+        console.log(`[${sessionName}] Sessão já está online.`);
+        return sessions.get(sessionName);
+    }
 
-    sock = makeWASocket({
+    console.log(`[${sessionName}] Iniciando sessão...`);
+    
+    // Cria pasta específica para cada sessão (auth_info/nome_da_sessao)
+    const authPath = path.join('auth_info', sessionName);
+    if (!fs.existsSync(authPath)) {
+        fs.mkdirSync(authPath, { recursive: true });
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(authPath);
+
+    const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false, // Desativado para evitar logs poluídos e erros
+        printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ["ZapCRM", "Chrome", "1.0.0"],
+        browser: Browsers.macOS("Chrome"), // Simula Chrome no Mac para evitar desconexões
         connectTimeoutMs: 60000,
-        syncFullHistory: false, // Acelera o startup
+        syncFullHistory: false,
     });
+
+    // Atualiza o estado na memória
+    if (!sessions.has(sessionName)) {
+        sessions.set(sessionName, { sock, status: 'iniciando', qrCode: null });
+    } else {
+        sessions.get(sessionName).sock = sock;
+    }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        const sessionData = sessions.get(sessionName);
 
         if (qr) {
-            console.log('QR Code recebido do WhatsApp');
+            console.log(`[${sessionName}] Novo QR Code gerado`);
             try {
-                // Gera a imagem do QR Code para exibição
-                currentQR = await QRCode.toDataURL(qr);
-                connectionStatus = 'aguardando_leitura';
+                sessionData.qrCode = await QRCode.toDataURL(qr);
+                sessionData.status = 'aguardando_leitura';
             } catch (err) {
-                console.error('Erro ao gerar imagem QR:', err);
+                console.error('Erro ao gerar QR:', err);
             }
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`Conexão fechada. Reconectando? ${shouldReconnect}`);
+            const code = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = code !== DisconnectReason.loggedOut;
+            
+            console.log(`[${sessionName}] Conexão fechada (${code}). Reconectando? ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                connectionStatus = 'reconectando';
-                // Delay para evitar loop frenético
-                setTimeout(connectToWhatsApp, 5000);
+                sessionData.status = 'reconectando';
+                setTimeout(() => startSession(sessionName), 3000); // Retry logic
             } else {
-                connectionStatus = 'desconectado_permanente';
-                currentQR = null;
-                console.log('Desconectado. Sessão encerrada.');
+                sessionData.status = 'desconectado';
+                sessionData.qrCode = null;
+                console.log(`[${sessionName}] Logout definitivo.`);
+                // Opcional: Apagar a pasta se for logout
+                // fs.rmSync(authPath, { recursive: true, force: true });
+                sessions.delete(sessionName);
             }
         } else if (connection === 'open') {
-            console.log('✅ Conexão estabelecida com sucesso!');
-            connectionStatus = 'conectado';
-            currentQR = null; // Limpa o QR pois já conectou
+            console.log(`[${sessionName}] ✅ Conectado com sucesso!`);
+            sessionData.status = 'connected';
+            sessionData.qrCode = null;
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    return sessionData;
 }
 
-// --- ROTA VISUAL (DIAGNÓSTICO) ---
+// --- ROTAS DA API ---
+
+// 1. Iniciar Sessão (Usado pelo Frontend)
+app.post('/start-session', async (req, res) => {
+    const { sessionName } = req.body;
+    
+    if (!sessionName) {
+        return res.status(400).json({ error: 'sessionName é obrigatório' });
+    }
+
+    try {
+        await startSession(sessionName);
+        // Pequeno delay para dar tempo do QR ser gerado se for novo
+        setTimeout(() => {
+            const data = sessions.get(sessionName);
+            res.json({
+                sessionName,
+                status: data?.status || 'iniciando',
+                qrCode: data?.qrCode
+            });
+        }, 2000);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 2. Status da Sessão Específica
+app.get('/status/:sessionName', (req, res) => {
+    const { sessionName } = req.params;
+    const session = sessions.get(sessionName);
+    
+    if (!session) {
+        return res.json({ status: 'offline', qrCode: null });
+    }
+    
+    res.json({
+        status: session.status,
+        qrCode: session.qrCode
+    });
+});
+
+// 3. Resetar/Logout de uma sessão
+app.post('/logout', async (req, res) => {
+    const { sessionName } = req.body;
+    const session = sessions.get(sessionName);
+    
+    if (session && session.sock) {
+        try {
+            await session.sock.logout();
+            sessions.delete(sessionName);
+            const authPath = path.join('auth_info', sessionName);
+            if (fs.existsSync(authPath)) {
+                fs.rmSync(authPath, { recursive: true, force: true });
+            }
+            res.json({ message: `Sessão ${sessionName} desconectada.` });
+        } catch (e) {
+            res.status(500).json({ error: 'Erro ao desconectar' });
+        }
+    } else {
+        res.status(404).json({ error: 'Sessão não encontrada' });
+    }
+});
+
+// --- DASHBOARD VISUAL (Raiz) ---
 app.get('/', (req, res) => {
-    // Página HTML simples para ver o status e o QR Code direto no navegador
+    // Gera HTML dinâmico listando todas as sessões ativas
+    const sessionsList = Array.from(sessions.entries()).map(([name, data]) => {
+        return `
+            <div class="session-card">
+                <h3>${name}</h3>
+                <div class="status ${data.status}">${data.status}</div>
+                ${data.qrCode 
+                    ? `<img src="${data.qrCode}" width="200" /><p class="instruction">Leia o QR Code</p>` 
+                    : data.status === 'connected' 
+                        ? `<div class="icon">✅</div><p>Online</p>`
+                        : `<div class="icon">⏳</div><p>Carregando...</p>`
+                }
+            </div>
+        `;
+    }).join('');
+
     const html = `
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ZapCRM Backend</title>
-        <meta http-equiv="refresh" content="5"> <!-- Atualiza a cada 5s -->
+        <title>ZapCRM Multi-Device</title>
+        <meta http-equiv="refresh" content="5">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body { font-family: -apple-system, sans-serif; background: #111b21; color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-            .card { background: #202c33; padding: 40px; border-radius: 20px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.3); max-width: 90%; width: 400px; }
-            h1 { margin-bottom: 10px; font-weight: 300; }
-            .status { font-weight: bold; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-bottom: 20px; }
-            .conectado { background: #00a884; color: white; }
-            .aguardando_leitura { background: #ffc107; color: black; }
-            .reconectando { background: #009de2; color: white; }
-            img { border: 10px solid white; border-radius: 8px; margin-top: 10px; }
-            p { color: #8696a0; font-size: 14px; margin-top: 20px; }
+            body { font-family: system-ui; background: #111b21; color: white; padding: 20px; }
+            h1 { text-align: center; font-weight: 300; }
+            .grid { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
+            .session-card { background: #202c33; padding: 20px; border-radius: 10px; text-align: center; width: 250px; border: 1px solid #333; }
+            .status { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; margin-bottom: 10px; text-transform: uppercase; }
+            .connected { background: #00a884; color: #fff; }
+            .aguardando_leitura { background: #ffc107; color: #000; }
+            .reconectando { background: #2196f3; }
+            .iniciando { background: #607d8b; }
+            .icon { font-size: 40px; margin: 20px 0; }
+            img { border-radius: 8px; border: 5px solid white; }
+            .instruction { color: #8696a0; font-size: 13px; }
+            .controls { text-align: center; margin-bottom: 30px; }
+            input { padding: 10px; border-radius: 5px; border: none; }
+            button { padding: 10px 20px; background: #00a884; color: white; border: none; border-radius: 5px; cursor: pointer; }
         </style>
     </head>
     <body>
-        <div class="card">
-            <h1>ZapCRM Server</h1>
-            <div class="status ${connectionStatus}">${connectionStatus.toUpperCase().replace('_', ' ')}</div>
-            
-            ${currentQR 
-                ? `<br><img src="${currentQR}" width="250" alt="QR Code WhatsApp" /><br><p>Abra o WhatsApp > Aparelhos Conectados > Conectar Aparelho</p>` 
-                : connectionStatus === 'conectado' 
-                    ? `<br><div style="font-size: 50px;">✅</div><p>Sistema Online e Operante</p>`
-                    : `<br><div style="font-size: 40px;">⏳</div><p>Gerando sessão...</p>`
-            }
+        <h1>ZapCRM Backend Manager</h1>
+        <div class="controls">
+            <form action="/start-session" method="POST" onsubmit="event.preventDefault(); startNew(this);">
+                <input type="text" id="newSession" placeholder="Nome da Sessão (ex: Vendas)" required />
+                <button type="submit">Criar Nova Sessão</button>
+            </form>
         </div>
+        <div class="grid">
+            ${sessionsList || '<p style="color:#888">Nenhuma sessão ativa no momento.</p>'}
+        </div>
+
+        <script>
+            async function startNew(form) {
+                const name = document.getElementById('newSession').value;
+                await fetch('/start-session', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ sessionName: name })
+                });
+                window.location.reload();
+            }
+        </script>
     </body>
     </html>
     `;
     res.send(html);
 });
 
-// Rota JSON para o Frontend (React)
-app.get('/status', (req, res) => {
-    res.json({
-        status: connectionStatus,
-        qrCode: currentQR
-    });
-});
-
-app.post('/reset', (req, res) => {
-    try {
-        if (sock) sock.end(undefined);
-        if (fs.existsSync('auth_info_baileys')) {
-            fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-        }
-        currentQR = null;
-        connectionStatus = 'resetando';
-        connectToWhatsApp();
-        res.json({ message: 'Sessão resetada.' });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+// Inicializa sessões salvas previamente no disco
+const initSavedSessions = () => {
+    if (fs.existsSync('auth_info')) {
+        const dirs = fs.readdirSync('auth_info', { withFileTypes: true })
+            .filter(dirent => dirent.isDirectory())
+            .map(dirent => dirent.name);
+        
+        console.log(`Encontradas ${dirs.length} sessões salvas: ${dirs.join(', ')}`);
+        dirs.forEach(name => startSession(name));
     }
-});
-
-connectToWhatsApp();
+};
 
 app.listen(PORT, () => {
     console.log(`Server rodando na porta ${PORT}`);
+    initSavedSessions();
 });
