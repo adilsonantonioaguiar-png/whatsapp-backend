@@ -1,193 +1,171 @@
-// index.js - Backend WhatsApp Baileys para Railway
 import express from 'express';
 import cors from 'cors';
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-} from '@whiskeysockets/baileys';
-import qrcode from 'qrcode';
-import P from 'pino';
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import QRCode from 'qrcode';
+import pino from 'pino';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
-// Logger do Baileys
-const logger = P({ level: 'info' });
-
-// Armazena sessões ativas em memória
 const sessions = new Map();
 
-/**
- * Cria ou obtém uma sessão existente
- */
-async function createOrGetSession(sessionName) {
-  if (sessions.has(sessionName)) {
-    return sessions.get(sessionName);
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(`./auth_info_${sessionName}`);
-
-  const sock = makeWASocket({
-    logger,
-    auth: state,
-    printQRInTerminal: true,
-  });
-
-  let currentQR = null;
-  let isConnected = false;
-  let user = null;
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      currentQR = qr;
-      logger.info({ sessionName }, 'Novo QR code gerado');
-    }
-
-    if (connection === 'open') {
-      isConnected = true;
-      user = sock.user;
-      logger.info({ sessionName, user }, 'Sessão conectada');
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-
-      logger.warn({ sessionName, shouldReconnect }, 'Conexão fechada');
-      if (!shouldReconnect) {
-        sessions.delete(sessionName);
-      }
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  const sessionData = { sock, currentQR, isConnected, user, sessionName };
-  sessions.set(sessionName, sessionData);
-
-  return sessionData;
-}
-
-/**
- * Rota de health check
- */
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'WhatsApp Baileys backend rodando' });
-});
-
-/**
- * Inicia sessão e retorna QR code
- */
+// Iniciar sessão
 app.post('/start-session', async (req, res) => {
   try {
     const { sessionName } = req.body;
+    console.log('🔵 [start-session] Nova requisição para sessão:', sessionName);
+
     if (!sessionName) {
       return res.status(400).json({ error: 'sessionName é obrigatório' });
     }
 
-    const session = await createOrGetSession(sessionName);
-
-    // Espera até 15s por um QR code
-    const start = Date.now();
-    while (!session.currentQR && Date.now() - start < 15000) {
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    // Verificar se sessão já existe
+    if (sessions.has(sessionName)) {
+      const existing = sessions.get(sessionName);
+      console.log('ℹ️ Sessão já existe, retornando QR salvo:', existing.qrCode ? 'SIM' : 'NÃO');
+      
+      if (existing.qrCode) {
+        return res.json({ qr: existing.qrCode, message: 'Sessão já existe' });
+      } else {
+        return res.status(202).json({ 
+          error: 'QR ainda sendo gerado', 
+          retryAfter: 2000 
+        });
+      }
     }
 
-    if (!session.currentQR && !session.isConnected) {
-      return res.status(504).json({
-        error: 'Timeout ao gerar QR code',
-      });
-    }
+    const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionName}`);
 
-    const qrImage = await qrcode.toDataURL(session.currentQR || '');
-    return res.json({
-      qr: qrImage,
-      connected: session.isConnected,
-      user: session.user,
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
     });
-  } catch (err) {
-    logger.error({ err }, 'Erro em /start-session');
-    return res.status(500).json({ error: 'Erro ao iniciar sessão' });
+
+    // ✅ SALVAR SESSÃO IMEDIATAMENTE (sem QR ainda)
+    const sessionData = { sock, qrCode: null };
+    sessions.set(sessionName, sessionData);
+    console.log('✅ Sessão criada e salva no Map:', sessionName);
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      console.log('🔁 [connection.update]', { sessionName, connection, hasQR: !!qr });
+
+      if (qr) {
+        try {
+          const qrCode = await QRCode.toDataURL(qr);
+          // Atualizar QR na sessão existente
+          const session = sessions.get(sessionName);
+          if (session) {
+            session.qrCode = qrCode;
+            sessions.set(sessionName, session);
+            console.log('✅ QR Code gerado e atualizado na sessão', sessionName);
+          }
+        } catch (err) {
+          console.error('❌ Erro ao gerar QR Code:', err);
+        }
+      }
+
+      if (connection === 'close') {
+        const shouldReconnect =
+          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log('🔴 Conexão fechada, reconectar?', shouldReconnect, 'sessão:', sessionName);
+
+        if (!shouldReconnect) {
+          sessions.delete(sessionName);
+          console.log('🗑️ Sessão removida do Map:', sessionName);
+        }
+      } else if (connection === 'open') {
+        console.log('🟢 Conexão aberta para', sessionName);
+      }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    // Esperar até 10 segundos pelo QR
+    let attempts = 0;
+    const maxAttempts = 20; // 20 x 500ms = 10 segundos
+    
+    while (attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const session = sessions.get(sessionName);
+      
+      if (session?.qrCode) {
+        console.log('✅ QR Code disponível após', attempts * 500, 'ms');
+        return res.json({ qr: session.qrCode });
+      }
+      
+      attempts++;
+    }
+
+    // Se chegou aqui, o QR não foi gerado em 10 segundos
+    console.warn('⚠️ QR Code não disponível após 10 segundos para sessão', sessionName);
+    return res.status(202).json({ 
+      error: 'QR ainda sendo gerado',
+      retryAfter: 2000,
+      message: 'Tente novamente em alguns segundos'
+    });
+
+  } catch (error) {
+    console.error('❌ Erro em /start-session:', error);
+    return res.status(500).json({ error: 'Erro interno no backend', details: error.message });
   }
 });
 
-/**
- * Status da sessão
- */
-app.get('/status/:sessionName', async (req, res) => {
-  try {
-    const { sessionName } = req.params;
-    const session = sessions.get(sessionName);
+// Verificar status
+app.get('/status/:sessionName', (req, res) => {
+  const { sessionName } = req.params;
+  const session = sessions.get(sessionName);
 
-    if (!session) {
-      return res.json({ connected: false, message: 'Sessão não encontrada' });
-    }
-
-    return res.json({
-      connected: session.isConnected,
-      user: session.user,
-    });
-  } catch (err) {
-    logger.error({ err }, 'Erro em /status');
-    return res.status(500).json({ error: 'Erro ao obter status' });
+  if (!session) {
+    return res.json({ connected: false });
   }
+
+  res.json({
+    connected: session.sock.user ? true : false,
+    user: session.sock.user,
+  });
 });
 
-/**
- * Logout da sessão
- */
+// Desconectar sessão
 app.post('/logout/:sessionName', async (req, res) => {
-  try {
-    const { sessionName } = req.params;
-    const session = sessions.get(sessionName);
+  const { sessionName } = req.params;
+  const session = sessions.get(sessionName);
 
-    if (!session) {
-      return res.status(404).json({ error: 'Sessão não encontrada' });
+  if (session) {
+    try {
+      await session.sock.logout();
+      console.log('✅ Logout realizado:', sessionName);
+    } catch (e) {
+      console.error('❌ Erro ao deslogar sessão', sessionName, e);
     }
-
-    await session.sock.logout();
     sessions.delete(sessionName);
-
-    return res.json({ success: true });
-  } catch (err) {
-    logger.error({ err }, 'Erro em /logout');
-    return res.status(500).json({ error: 'Erro ao fazer logout' });
   }
+
+  res.json({ message: 'Desconectado' });
 });
 
-/**
- * Enviar mensagem
- */
+// Enviar mensagem
 app.post('/send-message', async (req, res) => {
+  const { sessionName, to, message } = req.body;
+  const session = sessions.get(sessionName);
+
+  if (!session || !session.sock.user) {
+    return res.status(400).json({ error: 'Sessão não conectada' });
+  }
+
   try {
-    const { sessionName, number, message } = req.body;
-
-    if (!sessionName || !number || !message) {
-      return res.status(400).json({ error: 'sessionName, number e message são obrigatórios' });
-    }
-
-    const session = sessions.get(sessionName);
-
-    if (!session || !session.isConnected) {
-      return res.status(400).json({ error: 'Sessão não está conectada' });
-    }
-
-    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     await session.sock.sendMessage(jid, { text: message });
-
-    return res.json({ success: true });
-  } catch (err) {
-    logger.error({ err }, 'Erro em /send-message');
-    return res.status(500).json({ error: 'Erro ao enviar mensagem' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Erro ao enviar mensagem:', error);
+    res.status(500).json({ error: 'Erro ao enviar mensagem' });
   }
 });
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  logger.info(`Servidor rodando na porta ${PORT}`);
+  console.log(`🚀 Backend rodando na porta ${PORT}`);
 });
