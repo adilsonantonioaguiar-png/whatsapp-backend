@@ -1,260 +1,210 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
-import express from 'express';
-import cors from 'cors';
-import QRCode from 'qrcode';
-import fs from 'fs';
-import path from 'path';
-import pino from 'pino';
+import React, { useState, useEffect } from 'react';
+import { Smartphone, Plus, Trash2, RefreshCw, CheckCircle2, Wifi, ShieldCheck, XCircle, Loader2 } from 'lucide-react';
+import { Connection } from '../types';
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// URL do Backend (ajuste se estiver rodando local ou em outra URL no Railway)
+// Em produção, idealmente usar variável de ambiente ou caminho relativo se servido junto.
+// Como é um app React separado, assumimos o proxy ou URL direta.
+// Se der erro de CORS, verifique a URL.
+const API_URL = 'http://localhost:8080'; // Ou a URL do seu Railway sem barra no final
 
-const PORT = process.env.PORT || 8080;
+export const ConnectionManager: React.FC = () => {
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [showModal, setShowModal] = useState(false);
+  const [newSessionName, setNewSessionName] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<'online' | 'offline'>('offline');
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
 
-// Armazenamento em memória das sessões ativas e seus QRs
-const sessions = new Map(); 
+  // Polling para atualizar lista de sessões
+  useEffect(() => {
+    fetchSessions();
+    const interval = setInterval(fetchSessions, 3000); // Atualiza a cada 3s
+    return () => clearInterval(interval);
+  }, []);
 
-// Logger para depuração
-const logger = pino({ level: 'silent' }); // Silent para limpar o console do Railway
+  const fetchSessions = async () => {
+    try {
+      // Tenta usar caminho relativo primeiro (se proxy configurado) ou API_URL
+      const response = await fetch('/sessions').catch(() => fetch(`${API_URL}/sessions`));
+      
+      if (response.ok) {
+        const data = await response.json();
+        setConnections(data.map((s: any) => ({
+           id: s.id,
+           name: s.name, // Nome da sessão é o ID visual
+           phoneNumber: s.phoneNumber || '...',
+           status: s.status === 'connected' ? 'connected' : s.status === 'scan_needed' ? 'disconnected' : 'syncing',
+           battery: s.battery || 0,
+           qrCode: s.qrCode, // Backend manda base64
+           logs: []
+        })));
+        setBackendStatus('online');
+        setLastUpdated(new Date());
+      } else {
+        setBackendStatus('offline');
+      }
+    } catch (e) {
+      console.error("Erro ao buscar sessões:", e);
+      setBackendStatus('offline');
+    }
+  };
 
-// --- ROTAS ---
+  const handleCreateSession = async () => {
+    if (!newSessionName.trim()) return;
+    setLoading(true);
+    try {
+      await fetch('/start-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionName: newSessionName })
+      }).catch(() => fetch(`${API_URL}/start-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionName: newSessionName })
+      }));
+      
+      setNewSessionName('');
+      setShowModal(false);
+      // Força refresh imediato
+      setTimeout(fetchSessions, 500);
+    } catch (e) {
+      alert('Erro ao criar sessão. Verifique se o backend está online.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
-// 1. Dashboard Visual (Para diagnóstico e Scan)
-app.get('/', async (req, res) => {
-  const activeSessions = Array.from(sessions.entries()).map(([name, data]) => ({
-    name,
-    status: data.status,
-    qr: data.qrCode ? 'Disponível (Clique para ver)' : 'Não disponível',
-    phone: data.user?.id?.split(':')[0] || 'Desconhecido'
-  }));
+  const handleDeleteSession = async (sessionName: string) => {
+    if(!confirm(`Tem certeza que deseja apagar a sessão "${sessionName}"?`)) return;
+    try {
+        await fetch('/reset-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionName })
+        }).catch(() => fetch(`${API_URL}/reset-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionName })
+        }));
+        setTimeout(fetchSessions, 500);
+    } catch(e) {
+        alert('Erro ao deletar sessão');
+    }
+  };
 
-  const html = `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>ZapCRM Backend Manager</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <meta http-equiv="refresh" content="5"> <!-- Auto refresh a cada 5s -->
-      </head>
-      <body class="bg-slate-900 text-white p-8 font-sans">
-        <div class="max-w-4xl mx-auto">
-          <div class="flex justify-between items-center mb-8">
-            <h1 class="text-3xl font-bold text-emerald-400">ZapCRM Backend</h1>
-            <span class="bg-blue-600 px-3 py-1 rounded text-sm">Online • Porta ${PORT}</span>
-          </div>
-
-          <div class="bg-slate-800 rounded-lg p-6 shadow-xl border border-slate-700">
-            <h2 class="text-xl font-semibold mb-4 border-b border-slate-600 pb-2">Sessões Ativas (${activeSessions.length})</h2>
-            
-            ${activeSessions.length === 0 ? '<p class="text-gray-400 italic">Nenhuma sessão iniciada. O Frontend deve solicitar a conexão.</p>' : ''}
-
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-              ${activeSessions.map(s => `
-                <div class="bg-slate-700 p-4 rounded-lg flex flex-col gap-2 relative group">
-                  <div class="flex justify-between items-start">
-                    <h3 class="font-bold text-lg">${s.name}</h3>
-                    <span class="text-xs px-2 py-1 rounded ${s.status === 'connected' ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}">
-                      ${s.status.toUpperCase()}
-                    </span>
-                  </div>
-                  <p class="text-sm text-gray-300">📱 ${s.phone}</p>
-                  
-                  ${s.qr.includes('Disponível') ? `
-                    <div class="mt-2 bg-white p-2 rounded w-fit mx-auto">
-                       <img src="${sessions.get(s.name)?.qrCode}" class="w-32 h-32" />
-                    </div>
-                  ` : ''}
-
-                  <button onclick="resetSession('${s.name}')" class="mt-2 text-xs text-red-400 hover:text-red-300 underline text-right">
-                    Forçar Reset (Deletar Sessão)
-                  </button>
-                </div>
-              `).join('')}
-            </div>
-          </div>
+  return (
+    <div className="flex-1 h-full bg-app-bg p-8 overflow-y-auto">
+      <div className="max-w-6xl mx-auto">
+        
+        {/* Header */}
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+           <div>
+            <h1 className="text-3xl font-light text-gray-800 flex items-center gap-3">
+                <Smartphone className="text-whatsapp-green" /> Gerenciador de Instâncias
+            </h1>
+            <p className="text-gray-500 mt-1">
+                {connections.length} conexões ativas. Backend: <span className={backendStatus === 'online' ? 'text-green-600 font-bold' : 'text-red-500 font-bold'}>{backendStatus.toUpperCase()}</span>
+            </p>
+           </div>
+           
+           <button 
+                onClick={() => setShowModal(true)}
+                disabled={backendStatus === 'offline'}
+                className="bg-whatsapp-green text-white px-6 py-3 rounded-lg shadow hover:bg-emerald-600 flex items-center gap-2 transition-colors font-medium disabled:opacity-50"
+            >
+                <Plus size={20} /> Nova Instância
+            </button>
         </div>
 
-        <script>
-          async function resetSession(name) {
-            if(!confirm('Isso vai derrubar a conexão e apagar os arquivos de sessão do ' + name + '. Continuar?')) return;
-            try {
-              await fetch('/reset-session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sessionName: name })
-              });
-              alert('Sessão resetada. A página vai recarregar.');
-              window.location.reload();
-            } catch (e) {
-              alert('Erro ao resetar: ' + e.message);
-            }
-          }
-        </script>
-      </body>
-    </html>
-  `;
-  res.send(html);
-});
+        {/* Modal de Criação */}
+        {showModal && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm p-4 animate-in fade-in">
+                <div className="bg-white p-6 rounded-xl shadow-xl w-full max-w-sm">
+                    <div className="flex justify-between items-center mb-4">
+                        <h3 className="font-bold text-lg text-gray-800">Nova Sessão</h3>
+                        <button onClick={() => setShowModal(false)}><XCircle className="text-gray-400 hover:text-red-500"/></button>
+                    </div>
+                    <label className="block text-sm text-gray-600 mb-2">Nome do Atendente/Sessão</label>
+                    <input 
+                        type="text" 
+                        value={newSessionName}
+                        onChange={(e) => setNewSessionName(e.target.value)}
+                        placeholder="Ex: Suporte, Vendas, Joao"
+                        className="w-full border p-2 rounded mb-4 focus:ring-2 focus:ring-whatsapp-green outline-none"
+                    />
+                    <button 
+                        onClick={handleCreateSession}
+                        disabled={loading || !newSessionName}
+                        className="w-full bg-whatsapp-green text-white py-2 rounded font-bold hover:bg-emerald-600 disabled:opacity-50 flex justify-center items-center gap-2"
+                    >
+                        {loading && <Loader2 className="animate-spin" size={16}/>}
+                        Criar Sessão
+                    </button>
+                </div>
+            </div>
+        )}
 
-// 2. Iniciar Sessão (Chamado pelo Frontend)
-app.post('/start-session', async (req, res) => {
-  const { sessionName } = req.body;
-  
-  if (!sessionName) {
-    return res.status(400).json({ error: 'sessionName is required' });
-  }
+        {/* Grid de Conexões */}
+        {connections.length === 0 ? (
+            <div className="text-center py-20 bg-white rounded-xl border border-dashed border-gray-300">
+                <Smartphone size={48} className="mx-auto text-gray-300 mb-4" />
+                <h3 className="text-xl font-medium text-gray-500">Nenhuma instância ativa</h3>
+                <p className="text-gray-400">Clique em "Nova Instância" para conectar um WhatsApp.</p>
+            </div>
+        ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {connections.map(conn => (
+                    <div key={conn.id} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow relative">
+                        <div className="p-5 border-b border-gray-100 flex justify-between items-start">
+                            <div>
+                                <h3 className="font-bold text-gray-800 text-lg flex items-center gap-2">
+                                    {conn.name}
+                                    {conn.status === 'connected' ? (
+                                        <span className="px-2 py-0.5 bg-green-100 text-green-700 text-[10px] rounded-full font-bold uppercase flex items-center gap-1">
+                                            <CheckCircle2 size={10} /> Online
+                                        </span>
+                                    ) : (
+                                        <span className="px-2 py-0.5 bg-yellow-100 text-yellow-700 text-[10px] rounded-full font-bold uppercase flex items-center gap-1">
+                                            <RefreshCw size={10} className="animate-spin" /> {conn.status === 'syncing' ? 'Iniciando...' : 'Aguardando Scan'}
+                                        </span>
+                                    )}
+                                </h3>
+                                <p className="text-gray-500 text-sm font-mono mt-1">{conn.phoneNumber}</p>
+                            </div>
+                            <button onClick={() => handleDeleteSession(conn.name)} className="text-gray-400 hover:text-red-500 p-2" title="Remover Sessão">
+                                <Trash2 size={18} />
+                            </button>
+                        </div>
 
-  // Se já existe e está conectado, retorna ok
-  if (sessions.has(sessionName)) {
-    const current = sessions.get(sessionName);
-    if (current.status === 'connected') {
-      return res.json({ status: 'connected', message: 'Sessão já ativa' });
-    }
-  }
-
-  try {
-    await startSession(sessionName);
-    res.json({ status: 'initializing', message: 'Iniciando processo de autenticação...' });
-  } catch (error) {
-    console.error(`ERRO CRÍTICO ao iniciar ${sessionName}:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. Status da Sessão (Polling do Frontend)
-app.get('/session-status/:sessionName', (req, res) => {
-  const { sessionName } = req.params;
-  const session = sessions.get(sessionName);
-  
-  if (!session) {
-    return res.json({ status: 'not_found' });
-  }
-
-  res.json({
-    status: session.status,
-    qrCode: session.qrCode, // Base64
-    user: session.user
-  });
-});
-
-// 4. Resetar Sessão (Útil para loops de conexão)
-app.post('/reset-session', async (req, res) => {
-  const { sessionName } = req.body;
-  const authPath = path.resolve('auth_info', sessionName);
-
-  // 1. Fechar socket se existir
-  if (sessions.has(sessionName)) {
-    const s = sessions.get(sessionName);
-    if (s.sock) {
-      s.sock.end(undefined);
-    }
-    sessions.delete(sessionName);
-  }
-
-  // 2. Apagar pasta
-  try {
-    if (fs.existsSync(authPath)) {
-      fs.rmSync(authPath, { recursive: true, force: true });
-    }
-    console.log(`[${sessionName}] Pasta de sessão apagada.`);
-    res.json({ success: true });
-  } catch (e) {
-    console.error(`Erro ao apagar pasta ${sessionName}:`, e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// --- LÓGICA DO BAILEYS ---
-
-async function startSession(sessionName) {
-  const authPath = path.resolve('auth_info', sessionName);
-  
-  // Cria a pasta se não existir
-  if (!fs.existsSync(authPath)) {
-    fs.mkdirSync(authPath, { recursive: true });
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
-
-  const sock = makeWASocket({
-    auth: state, // <--- AQUI ESTAVA O ERRO: state e não sessionData
-    printQRInTerminal: false,
-    logger,
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false, // Otimização para carregar rápido
-    connectTimeoutMs: 60000,
-  });
-
-  // Atualiza o Map de sessões
-  sessions.set(sessionName, {
-    sock,
-    status: 'connecting',
-    qrCode: null,
-    user: null
-  });
-
-  // Evento: Credenciais atualizadas (Salvar sessão)
-  sock.ev.on('creds.update', saveCreds);
-
-  // Evento: Atualização de Conexão
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const sessionInfo = sessions.get(sessionName);
-
-    if (qr) {
-      console.log(`[${sessionName}] Novo QR Code gerado`);
-      // Converter QR para Base64 para exibir no front
-      const qrBase64 = await QRCode.toDataURL(qr);
-      if (sessionInfo) {
-        sessionInfo.qrCode = qrBase64;
-        sessionInfo.status = 'scan_needed';
-      }
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`[${sessionName}] Conexão fechada. Reconectar? ${shouldReconnect}`);
-      
-      if (shouldReconnect) {
-        if (sessionInfo) sessionInfo.status = 'reconnecting';
-        // Delay para evitar loops frenéticos
-        setTimeout(() => startSession(sessionName), 3000);
-      } else {
-        console.log(`[${sessionName}] Desconectado permanentemente (Logged Out).`);
-        if (sessionInfo) {
-          sessionInfo.status = 'disconnected';
-          sessions.delete(sessionName);
-        }
-        // Limpar pasta para permitir novo scan limpo
-        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch {}
-      }
-    } else if (connection === 'open') {
-      console.log(`[${sessionName}] CONEXÃO ESTABELECIDA!`);
-      if (sessionInfo) {
-        sessionInfo.status = 'connected';
-        sessionInfo.qrCode = null; // Limpa QR
-        sessionInfo.user = sock.user;
-      }
-    }
-  });
-}
-
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`Server rodando na porta ${PORT}`);
-  
-  // Tentar restaurar sessões existentes na pasta auth_info ao iniciar
-  const authRoot = path.resolve('auth_info');
-  if (fs.existsSync(authRoot)) {
-    const existingSessions = fs.readdirSync(authRoot).filter(f => fs.statSync(path.join(authRoot, f)).isDirectory());
-    console.log(`Encontradas ${existingSessions.length} sessões salvas: ${existingSessions.join(', ')}`);
-    
-    existingSessions.forEach(sessionName => {
-      console.log(`[${sessionName}] Tentando restaurar automaticamente...`);
-      startSession(sessionName).catch(e => console.error(`Falha ao restaurar ${sessionName}:`, e));
-    });
-  }
-});
+                        {/* Área do QR Code ou Status */}
+                        <div className="p-6 flex flex-col items-center justify-center bg-gray-50 min-h-[250px]">
+                            {conn.status === 'connected' ? (
+                                <div className="text-center">
+                                    <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                        <ShieldCheck size={40} className="text-green-600" />
+                                    </div>
+                                    <h4 className="font-bold text-green-700">WhatsApp Conectado!</h4>
+                                    <p className="text-sm text-gray-500 mt-2">Pronto para enviar e receber mensagens.</p>
+                                </div>
+                            ) : conn.qrCode ? (
+                                <div className="text-center">
+                                    <img src={conn.qrCode} alt="QR Code" className="w-48 h-48 border-4 border-white shadow-lg rounded-lg mx-auto" />
+                                    <p className="text-xs text-gray-500 mt-4 animate-pulse">Escaneie com o WhatsApp</p>
+                                </div>
+                            ) : (
+                                <div className="text-center flex flex-col items-center">
+                                    <Loader2 size={32} className="animate-spin text-whatsapp-green mb-3" />
+                                    <p className="text-gray-500">Gerando QR Code...</p>
+                                    <p className="text-xs text-gray-400">Aguarde a inicialização do Baileys</p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                ))}
+            </div>
+        )}
+      </div>
+    </div>
+  );
+};
