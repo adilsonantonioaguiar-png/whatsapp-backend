@@ -1,11 +1,21 @@
 {
   "name": "whatsapp-backend",
   "version": "1.0.0",
+  "description": "Backend API para conexão WhatsApp via Baileys",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "api",
+    "backend"
+  ],
+  "author": "ZapCRM",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
@@ -14,4 +24,3 @@
     "pino": "^8.16.0"
   }
 }
-
