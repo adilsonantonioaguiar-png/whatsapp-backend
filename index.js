@@ -55,7 +55,7 @@ app.post('/start-session', async (req, res) => {
 
   sessions.set(sessionName, { sock, qrCode });
 
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 8000));
 
   const session = sessions.get(sessionName);
   res.json({ qr: session.qrCode });
