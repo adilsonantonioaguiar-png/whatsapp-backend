@@ -13,11 +13,15 @@ const sessions = new Map();
 // Iniciar sessão
 app.post('/start-session', async (req, res) => {
   try {
-    const { sessionName } = req.body;
-    console.log('🔵 [start-session] Nova requisição para sessão:', sessionName);
+    const { sessionName, phoneNumber } = req.body;
+    console.log('🔵 [start-session] Nova requisição:', { sessionName, phoneNumber });
 
     if (!sessionName) {
       return res.status(400).json({ error: 'sessionName é obrigatório' });
+    }
+
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'phoneNumber é obrigatório' });
     }
 
     // Verificar se sessão já existe
@@ -41,21 +45,27 @@ app.post('/start-session', async (req, res) => {
       auth: state,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
+      mobile: false,
+      browser: ['WhatsApp CRM', 'Chrome', '1.0.0'],
     });
 
     // ✅ SALVAR SESSÃO IMEDIATAMENTE (sem QR ainda)
-    const sessionData = { sock, qrCode: null };
+    const sessionData = { 
+      sock, 
+      qrCode: null, 
+      phoneNumber,
+      createdAt: new Date().toISOString() 
+    };
     sessions.set(sessionName, sessionData);
-    console.log('✅ Sessão criada e salva no Map:', sessionName);
+    console.log('✅ Sessão criada e salva no Map:', sessionName, 'para', phoneNumber);
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      console.log('🔁 [connection.update]', { sessionName, connection, hasQR: !!qr });
+      console.log('🔁 [connection.update]', { sessionName, phoneNumber, connection, hasQR: !!qr });
 
       if (qr) {
         try {
           const qrCode = await QRCode.toDataURL(qr);
-          // Atualizar QR na sessão existente
           const session = sessions.get(sessionName);
           if (session) {
             session.qrCode = qrCode;
@@ -77,7 +87,7 @@ app.post('/start-session', async (req, res) => {
           console.log('🗑️ Sessão removida do Map:', sessionName);
         }
       } else if (connection === 'open') {
-        console.log('🟢 Conexão aberta para', sessionName);
+        console.log('🟢 Conexão aberta para', sessionName, '(', phoneNumber, ')');
       }
     });
 
@@ -85,7 +95,7 @@ app.post('/start-session', async (req, res) => {
 
     // Esperar até 10 segundos pelo QR
     let attempts = 0;
-    const maxAttempts = 20; // 20 x 500ms = 10 segundos
+    const maxAttempts = 20;
     
     while (attempts < maxAttempts) {
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -99,7 +109,6 @@ app.post('/start-session', async (req, res) => {
       attempts++;
     }
 
-    // Se chegou aqui, o QR não foi gerado em 10 segundos
     console.warn('⚠️ QR Code não disponível após 10 segundos para sessão', sessionName);
     return res.status(202).json({ 
       error: 'QR ainda sendo gerado',
@@ -125,6 +134,7 @@ app.get('/status/:sessionName', (req, res) => {
   res.json({
     connected: session.sock.user ? true : false,
     user: session.sock.user,
+    phoneNumber: session.phoneNumber,
   });
 });
 
